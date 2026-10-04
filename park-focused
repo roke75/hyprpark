@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+address=$(hyprctl activewindow -j | jq -er '.address | select(test("^0x[0-9a-fA-F]+$"))')
+hyprctl dispatch "(function() hl.plugin.hyprpark.park('$address'); return hl.dsp.no_op() end)()"
