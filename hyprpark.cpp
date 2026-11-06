@@ -1,8 +1,16 @@
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
+#if !__has_include(<hyprland/src/desktop/view/Window.hpp>)
+#define HYPRPARK_NEW_API 1
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowGroupMembership.hpp>
+#include <hyprland/src/ipc/s2/S2.hpp>
+#else
+#define HYPRPARK_NEW_API 0
 #include <hyprland/src/desktop/view/Window.hpp>
-#include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
+#endif
+#include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
@@ -27,12 +35,40 @@ struct ParkedWindow {
 };
 
 static std::vector<ParkedWindow> parked;
+#if HYPRPARK_NEW_API
+static SP<IPC::Socket1::SCommand> statusCommand;
+#else
 static SP<SHyprCtlCommand> statusCommand;
+#endif
+
+static bool isMapped(const PHLWINDOW& w) {
+#if HYPRPARK_NEW_API
+    return w->mapped();
+#else
+    return w->m_isMapped;
+#endif
+}
+
+static bool isGrouped(const PHLWINDOW& w) {
+#if HYPRPARK_NEW_API
+    return static_cast<bool>(w->grouping().group());
+#else
+    return static_cast<bool>(w->m_group);
+#endif
+}
+
+static void postChange() {
+#if HYPRPARK_NEW_API
+    IPC::Socket2::sock()->postEvent({"hyprpark", ""});
+#else
+    g_pEventManager->postEvent({"hyprpark", ""});
+#endif
+}
 
 // Resolve IPC addresses against mapped windows rather than dereferencing pointers.
 static PHLWINDOW findWindow(const std::string& address) {
     for (const auto& w : Desktop::windowState()->windows()) {
-        if (w->m_isMapped && std::format("0x{:x}", reinterpret_cast<uintptr_t>(w.get())) == address)
+        if (isMapped(w) && std::format("0x{:x}", reinterpret_cast<uintptr_t>(w.get())) == address)
             return w;
     }
     return nullptr;
@@ -41,7 +77,8 @@ static PHLWINDOW findWindow(const std::string& address) {
 // Closure events are handled by the shell; prune stale entries before queries/actions.
 static void prune() {
     std::erase_if(parked, [](const auto& entry) {
-        return !entry.window || !entry.window->m_isMapped;
+        const auto w = entry.window.lock();
+        return !w || !isMapped(w);
     });
 }
 
@@ -52,7 +89,7 @@ static void redraw(PHLWINDOW w) {
 
 static int parkWindow(lua_State* L) {
     const auto w = findWindow(luaL_checkstring(L, 1));
-    if (!w || w->isHidden() || w->m_group)
+    if (!w || w->isHidden() || isGrouped(w))
         return luaL_error(L, "hyprpark: window unavailable, already hidden, or grouped");
     prune();
 
@@ -75,14 +112,14 @@ static int parkWindow(lua_State* L) {
         target->setSpaceGhost(target->space());
     redraw(w);
     g_pInputManager->refocus();
-    g_pEventManager->postEvent({"hyprpark", ""});
+    postChange();
     return 0;
 }
 
 // Reinsert a detached tile using the current layout and reapply saved modes.
 static void reveal(const ParkedWindow& entry) {
     const auto w = entry.window.lock();
-    if (!w || !w->m_isMapped)
+    if (!w || !isMapped(w))
         return;
     w->setHidden(false);
 
@@ -106,11 +143,12 @@ static int restoreWindow(lua_State* L) {
         return 0;
     reveal(*it);
     parked.erase(it);
-    g_pEventManager->postEvent({"hyprpark", ""});
+    postChange();
     redraw(w);
     return 0;
 }
 
+#if !HYPRPARK_NEW_API
 // Dispatchers share the Lua implementation so both interfaces enforce ownership.
 static SDispatchResult dispatch(const std::string& address, bool restore) {
     auto* L = luaL_newstate();
@@ -134,16 +172,29 @@ static SDispatchResult dispatch(const std::string& address, bool restore) {
     return {.success = success, .error = error};
 }
 
+#endif
+
 static void restoreAll() {
     for (const auto& entry : parked)
         reveal(entry);
     parked.clear();
-    g_pEventManager->postEvent({"hyprpark", ""});
+    postChange();
 }
 
 static int restoreAllLua(lua_State*) {
     restoreAll();
     return 0;
+}
+
+static std::string listWindows() {
+    prune();
+    std::string json = "[";
+    for (const auto& entry : parked) {
+        if (json.size() > 1)
+            json += ",";
+        json += std::format("\"0x{:x}\"", reinterpret_cast<uintptr_t>(entry.window.lock().get()));
+    }
+    return json + "]";
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -161,6 +212,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
         !HyprlandAPI::addLuaFunction(handle, "hyprpark", "restore_all", restoreAllLua))
         throw std::runtime_error("hyprpark: unable to register Lua functions");
 
+#if !HYPRPARK_NEW_API
+    // The new API retains addDispatcherV2 only as a stub returning false.
     if (!HyprlandAPI::addDispatcherV2(handle, "hyprpark:park",
                                      [](std::string address) { return dispatch(address, false); }) ||
         !HyprlandAPI::addDispatcherV2(handle, "hyprpark:restore",
@@ -170,22 +223,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
             return SDispatchResult{};
         }))
         throw std::runtime_error("hyprpark: unable to register dispatchers");
+#endif
 
     // Always return JSON so shells can rebuild their view after a reload.
+#if HYPRPARK_NEW_API
+    statusCommand = HyprlandAPI::registerHyprCtlCommand(handle, {
+        .name = "hyprparkwindows",
+        .match = IPC::Socket1::COMMAND_MATCH_EXACT,
+        .handler = [](const IPC::Socket1::SRequest&) { return IPC::Socket1::SResponse{listWindows()}; }
+    });
+#else
     statusCommand = HyprlandAPI::registerHyprCtlCommand(handle, {
         .name = "hyprparkwindows",
         .exact = true,
         .fn = [](eHyprCtlOutputFormat, std::string) {
-            prune();
-            std::string json = "[";
-            for (const auto& entry : parked) {
-                if (json.size() > 1)
-                    json += ",";
-                json += std::format("\"0x{:x}\"", reinterpret_cast<uintptr_t>(entry.window.lock().get()));
-            }
-            return json + "]";
+            return listWindows();
         }
     });
+#endif
     if (!statusCommand)
         throw std::runtime_error("hyprpark: unable to register status command");
     return {"hyprpark", "Park windows in place and free their tiled space", "AI-generated", "0.1.0"};
